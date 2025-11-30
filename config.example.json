@@ -1,0 +1,18 @@
+{
+    "asterisk": {
+        "host": "192.168.1.100",
+        "port": 5038,
+        "username": "admin",
+        "secret": "your_ami_password"
+    },
+    "woocommerce": {
+        "url": "https://your-store.com",
+        "consumer_key": "ck_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "consumer_secret": "cs_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    "settings": {
+        "notification_duration": 10,
+        "popup_on_call": true,
+        "log_level": "INFO"
+    }
+}
