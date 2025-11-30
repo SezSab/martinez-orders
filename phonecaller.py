@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any, List
 import requests
 
 # App version - bump this for each release
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 GITHUB_REPO = "SezSab/martinez-orders"
 
 from PyQt6.QtWidgets import (
@@ -973,9 +973,16 @@ class AsteriskAMI:
                     continue  # Will trigger reconnect
 
                 buffer += data
-                while '\r\n\r\n' in buffer:
-                    event_str, buffer = buffer.split('\r\n\r\n', 1)
-                    self._process_event(event_str)
+
+                # Normalize line endings for cross-platform compatibility
+                # AMI typically sends \r\n, but we handle both \r\n and \n
+                buffer = buffer.replace('\r\n', '\n')
+
+                # Events are separated by double newline
+                while '\n\n' in buffer:
+                    event_str, buffer = buffer.split('\n\n', 1)
+                    if event_str.strip():
+                        self._process_event(event_str)
 
             except socket.timeout:
                 continue
@@ -1017,7 +1024,9 @@ class AsteriskAMI:
 
     def _process_event(self, event_str: str):
         event = {}
-        for line in event_str.strip().split('\r\n'):
+        # Handle both \n and \r\n line endings
+        for line in event_str.strip().split('\n'):
+            line = line.strip()
             if ':' in line:
                 key, value = line.split(':', 1)
                 event[key.strip()] = value.strip()
