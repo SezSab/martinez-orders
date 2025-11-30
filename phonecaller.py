@@ -21,7 +21,7 @@ from typing import Optional, Dict, Any, List
 import requests
 
 # App version - bump this for each release
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 GITHUB_REPO = "SezSab/martinez-orders"
 
 from PyQt6.QtWidgets import (
