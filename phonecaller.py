@@ -7,22 +7,272 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Optional, Dict, Any, List
 
+import requests
+
+# App version - bump this for each release
+APP_VERSION = "1.0.0"
+GITHUB_REPO = "SezSab/martinez-orders"
+
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QGridLayout, QComboBox, QTabWidget, QTabBar,
-    QStyledItemDelegate, QStyleOptionViewItem, QStyle
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle, QDialog, QProgressBar
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject, QModelIndex, QTimer, QRectF
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QModelIndex, QTimer, QRectF, QThread
 from PyQt6.QtGui import QFont, QColor, QPalette, QPainter, QBrush, QPen, QIcon, QPixmap
+
+
+class UpdateChecker(QThread):
+    """Background thread to check for updates"""
+    update_available = pyqtSignal(str, str)  # version, download_url
+    no_update = pyqtSignal()
+    error = pyqtSignal(str)
+
+    def run(self):
+        try:
+            url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                release = response.json()
+                latest_version = release['tag_name'].lstrip('v')
+
+                # Compare versions
+                if self._is_newer(latest_version, APP_VERSION):
+                    # Find the exe download URL
+                    download_url = None
+                    for asset in release.get('assets', []):
+                        if asset['name'].endswith('.exe'):
+                            download_url = asset['browser_download_url']
+                            break
+
+                    if download_url:
+                        self.update_available.emit(latest_version, download_url)
+                    else:
+                        self.no_update.emit()
+                else:
+                    self.no_update.emit()
+            elif response.status_code == 404:
+                self.no_update.emit()  # No releases yet
+            else:
+                self.error.emit(f"GitHub API error: {response.status_code}")
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _is_newer(self, latest: str, current: str) -> bool:
+        """Compare version strings (e.g., '1.0.1' > '1.0.0')"""
+        try:
+            latest_parts = [int(x) for x in latest.split('.')]
+            current_parts = [int(x) for x in current.split('.')]
+            return latest_parts > current_parts
+        except:
+            return False
+
+
+class UpdateDownloader(QThread):
+    """Background thread to download update"""
+    progress = pyqtSignal(int)  # percentage
+    finished = pyqtSignal(str)  # path to downloaded file
+    error = pyqtSignal(str)
+
+    def __init__(self, download_url: str):
+        super().__init__()
+        self.download_url = download_url
+
+    def run(self):
+        try:
+            # Download to temp file
+            response = requests.get(self.download_url, stream=True, timeout=60)
+            response.raise_for_status()
+
+            total_size = int(response.headers.get('content-length', 0))
+            downloaded = 0
+
+            # Create temp file
+            temp_dir = tempfile.gettempdir()
+            temp_file = os.path.join(temp_dir, "MartinezOrders_update.exe")
+
+            with open(temp_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total_size > 0:
+                            progress = int(downloaded * 100 / total_size)
+                            self.progress.emit(progress)
+
+            self.finished.emit(temp_file)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class UpdateDialog(QDialog):
+    """Dialog for showing update progress and installing"""
+
+    def __init__(self, new_version: str, download_url: str, parent=None):
+        super().__init__(parent)
+        self.new_version = new_version
+        self.download_url = download_url
+        self.downloader = None
+        self.downloaded_file = None
+
+        self.setWindowTitle("Update Available")
+        self.setFixedSize(400, 200)
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(15)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Info label
+        self.info_label = QLabel(f"New version {new_version} is available!\nCurrent version: {APP_VERSION}")
+        self.info_label.setFont(QFont("Segoe UI", 12))
+        self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.info_label)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #ccc;
+                border-radius: 5px;
+                text-align: center;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #7c3aed;
+                border-radius: 4px;
+            }
+        """)
+        layout.addWidget(self.progress_bar)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        self.download_btn = QPushButton("Download && Install")
+        self.download_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.download_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.download_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #7c3aed;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #6d28d9;
+            }
+            QPushButton:disabled {
+                background-color: #ccc;
+            }
+        """)
+        self.download_btn.clicked.connect(self._start_download)
+        btn_layout.addWidget(self.download_btn)
+
+        self.cancel_btn = QPushButton("Later")
+        self.cancel_btn.setFont(QFont("Segoe UI", 11))
+        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e0e0e0;
+                color: #333;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 20px;
+            }
+            QPushButton:hover {
+                background-color: #d0d0d0;
+            }
+        """)
+        self.cancel_btn.clicked.connect(self.reject)
+        btn_layout.addWidget(self.cancel_btn)
+
+        layout.addLayout(btn_layout)
+
+    def _start_download(self):
+        self.download_btn.setEnabled(False)
+        self.download_btn.setText("Downloading...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+
+        self.downloader = UpdateDownloader(self.download_url)
+        self.downloader.progress.connect(self._on_progress)
+        self.downloader.finished.connect(self._on_download_finished)
+        self.downloader.error.connect(self._on_download_error)
+        self.downloader.start()
+
+    def _on_progress(self, value: int):
+        self.progress_bar.setValue(value)
+
+    def _on_download_finished(self, file_path: str):
+        self.downloaded_file = file_path
+        self.info_label.setText("Download complete!\nThe app will restart to install the update.")
+        self.download_btn.setText("Install Now")
+        self.download_btn.setEnabled(True)
+        self.download_btn.clicked.disconnect()
+        self.download_btn.clicked.connect(self._install_update)
+
+    def _on_download_error(self, error: str):
+        self.info_label.setText(f"Download failed:\n{error}")
+        self.download_btn.setText("Retry")
+        self.download_btn.setEnabled(True)
+
+    def _install_update(self):
+        if not self.downloaded_file or not os.path.exists(self.downloaded_file):
+            QMessageBox.warning(self, "Error", "Downloaded file not found")
+            return
+
+        # Get current executable path
+        if getattr(sys, 'frozen', False):
+            # Running as compiled exe
+            current_exe = sys.executable
+            current_dir = os.path.dirname(current_exe)
+
+            # Create a batch script to:
+            # 1. Wait for current process to exit
+            # 2. Replace the exe
+            # 3. Start the new exe
+            # 4. Delete the batch script
+
+            batch_script = os.path.join(tempfile.gettempdir(), "update_martinez.bat")
+            new_exe_name = os.path.basename(current_exe)
+
+            batch_content = f'''@echo off
+echo Updating Martinez Orders...
+timeout /t 2 /nobreak > nul
+copy /Y "{self.downloaded_file}" "{current_exe}"
+start "" "{current_exe}"
+del "{self.downloaded_file}"
+del "%~f0"
+'''
+            with open(batch_script, 'w') as f:
+                f.write(batch_content)
+
+            # Run the batch script and exit
+            subprocess.Popen(['cmd', '/c', batch_script],
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == 'win32' else 0)
+            QApplication.quit()
+        else:
+            # Running as Python script - just show message
+            QMessageBox.information(
+                self,
+                "Update Downloaded",
+                f"Update downloaded to:\n{self.downloaded_file}\n\nPlease replace the executable manually."
+            )
+            self.accept()
 
 # ElevenLabs Call Status definitions (from WooCommerce plugin)
 CALL_STATUSES = {
@@ -779,30 +1029,64 @@ class AsteriskAMI:
         linked_id = event.get('Linkedid', unique_id)  # LinkedID links all channels of same call
         connected_num = event.get('ConnectedLineNum', '')
         exten = event.get('Exten', '')
+        dest_channel = event.get('DestChannel', '')
         dest_caller_id = event.get('DestCallerIDNum', '')
 
         state = event.get('ChannelStateDesc', '')
 
-        # Debug logging
-        if event_type in ('Newstate', 'DialBegin', 'Newchannel', 'Dial'):
-            logger.info(f"AMI: {event_type} | CallerID: {caller_id or 'N/A'} | Channel: {channel[:25] if channel else 'N/A'} | State: {state} | ConnectedLine: {connected_num}")
+        # Debug logging for relevant events
+        if event_type in ('Newstate', 'DialBegin', 'DialState', 'Newchannel', 'Dial', 'Bridge'):
+            logger.info(f"AMI: {event_type} | CallerID: {caller_id or 'N/A'} | Channel: {channel[:30] if channel else 'N/A'} | State: {state} | ConnectedLine: {connected_num} | DestChannel: {dest_channel[:30] if dest_channel else 'N/A'}")
 
-        # Strategy: Trigger when watch_channel (e.g., SIP/1034) rings with incoming call
-        # ConnectedLineNum contains the actual caller number
+        # Strategy: Catch incoming calls to watch_channel using multiple detection methods
+        # This ensures we don't miss calls that arrive via different paths
 
-        if event_type == 'Newstate' and state == 'Ringing' and self.watch_channel and channel:
-            channel_base = channel.upper().split('-')[0]  # Get "SIP/1034" from "SIP/1034-00000123"
+        actual_caller = None
+        matched = False
+
+        # Method 1: DialBegin - when a call starts dialing to our extension
+        # This is often the earliest and most reliable event
+        if event_type == 'DialBegin' and self.watch_channel and dest_channel:
+            dest_base = dest_channel.upper().split('-')[0]
+            if dest_base == self.watch_channel:
+                # CallerIDNum on the source channel is the external caller
+                actual_caller = caller_id if caller_id and caller_id not in ('<unknown>', '', 's', 'anonymous') else None
+                if actual_caller:
+                    matched = True
+                    logger.info(f">>> MATCH via DialBegin! Caller {actual_caller} -> {self.watch_channel}")
+
+        # Method 2: DialState with Ringing - backup detection
+        if not matched and event_type == 'DialState' and self.watch_channel and dest_channel:
+            dest_base = dest_channel.upper().split('-')[0]
+            if dest_base == self.watch_channel and state == 'Ringing':
+                actual_caller = caller_id if caller_id and caller_id not in ('<unknown>', '', 's', 'anonymous') else None
+                if actual_caller:
+                    matched = True
+                    logger.info(f">>> MATCH via DialState! Caller {actual_caller} -> {self.watch_channel}")
+
+        # Method 3: Newstate Ringing on watch_channel - original method as fallback
+        if not matched and event_type == 'Newstate' and state == 'Ringing' and self.watch_channel and channel:
+            channel_base = channel.upper().split('-')[0]
             if channel_base == self.watch_channel:
                 # ConnectedLineNum is the actual caller for incoming calls
-                actual_caller = connected_num if connected_num and connected_num not in ('<unknown>', '', 's') else None
+                actual_caller = connected_num if connected_num and connected_num not in ('<unknown>', '', 's', 'anonymous') else None
+                # Also try CallerIDNum if ConnectedLineNum is not available
+                if not actual_caller:
+                    actual_caller = caller_id if caller_id and caller_id not in ('<unknown>', '', 's', 'anonymous') else None
                 if actual_caller:
-                    call_key = f"call_{linked_id}_{actual_caller}"
-                    if call_key not in self._processed_calls:
-                        self._processed_calls.add(call_key)
-                        if len(self._processed_calls) > 100:
-                            self._processed_calls = set(list(self._processed_calls)[-50:])
-                        logger.info(f">>> MATCH! {self.watch_channel} ringing, caller: {actual_caller}")
-                        self.signals.incoming_call.emit(actual_caller, event)
+                    matched = True
+                    logger.info(f">>> MATCH via Newstate! {self.watch_channel} ringing, caller: {actual_caller}")
+
+        # Emit signal if we found a caller
+        if matched and actual_caller:
+            call_key = f"call_{linked_id}_{actual_caller}"
+            if call_key not in self._processed_calls:
+                self._processed_calls.add(call_key)
+                # Clean up old entries
+                if len(self._processed_calls) > 200:
+                    self._processed_calls = set(list(self._processed_calls)[-100:])
+                logger.info(f">>> EMITTING incoming call from: {actual_caller}")
+                self.signals.incoming_call.emit(actual_caller, event)
 
 
 class LoadingOverlay(QWidget):
@@ -1954,7 +2238,56 @@ class MainWindow(QMainWindow):
         title.setStyleSheet("color: #7c3aed; margin-left: 10px;")
         top_bar.addWidget(title)
 
+        # Version label
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setFont(QFont("Segoe UI", 10))
+        version_label.setStyleSheet("color: #999; margin-left: 10px;")
+        top_bar.addWidget(version_label)
+
         top_bar.addStretch()
+
+        # Update button (hidden by default)
+        self.update_btn = QPushButton("Update Available")
+        self.update_btn.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
+        self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.update_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 15px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+        """)
+        self.update_btn.setVisible(False)
+        self.update_btn.clicked.connect(self._show_update_dialog)
+        top_bar.addWidget(self.update_btn)
+
+        # Check for updates button
+        self.check_update_btn = QPushButton("Check Updates")
+        self.check_update_btn.setFont(QFont("Segoe UI", 10))
+        self.check_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check_update_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #e0e0e0;
+                color: #333;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #d0d0d0;
+            }
+            QPushButton:disabled {
+                background-color: #f0f0f0;
+                color: #999;
+            }
+        """)
+        self.check_update_btn.clicked.connect(self._check_for_updates)
+        top_bar.addWidget(self.check_update_btn)
 
         # Status indicator
         self.status_frame = QFrame()
@@ -2120,6 +2453,60 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.activateWindow()
         self.raise_()
+
+    def _check_for_updates(self, silent: bool = False):
+        """Check GitHub for updates"""
+        self.check_update_btn.setEnabled(False)
+        self.check_update_btn.setText("Checking...")
+        self._silent_update_check = silent
+
+        self.update_checker = UpdateChecker()
+        self.update_checker.update_available.connect(self._on_update_available)
+        self.update_checker.no_update.connect(self._on_no_update)
+        self.update_checker.error.connect(self._on_update_error)
+        self.update_checker.start()
+
+    def _on_update_available(self, version: str, download_url: str):
+        """Called when a new version is available"""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("Check Updates")
+
+        # Store update info
+        self._pending_update_version = version
+        self._pending_update_url = download_url
+
+        # Show update button
+        self.update_btn.setText(f"Update to v{version}")
+        self.update_btn.setVisible(True)
+
+        # If not silent, show dialog immediately
+        if not getattr(self, '_silent_update_check', False):
+            self._show_update_dialog()
+
+    def _on_no_update(self):
+        """Called when app is up to date"""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("Check Updates")
+
+        if not getattr(self, '_silent_update_check', False):
+            QMessageBox.information(self, "Up to Date", f"You are running the latest version (v{APP_VERSION})")
+
+    def _on_update_error(self, error: str):
+        """Called when update check fails"""
+        self.check_update_btn.setEnabled(True)
+        self.check_update_btn.setText("Check Updates")
+
+        if not getattr(self, '_silent_update_check', False):
+            QMessageBox.warning(self, "Update Check Failed", f"Could not check for updates:\n{error}")
+
+    def _show_update_dialog(self):
+        """Show the update dialog"""
+        version = getattr(self, '_pending_update_version', None)
+        url = getattr(self, '_pending_update_url', None)
+
+        if version and url:
+            dialog = UpdateDialog(version, url, self)
+            dialog.exec()
 
 
 def set_macos_dock_icon(pixmap: QPixmap):
