@@ -22,7 +22,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: '3.11'
+        python-version: '3.10'
 
     - name: Install dependencies
       run: |
@@ -32,7 +32,7 @@ jobs:
 
     - name: Build executable
       run: |
-        pyinstaller --onefile --windowed --name "MartinezOrders" --icon=icon.ico --add-data "config.example.json;." phonecaller.py
+        pyinstaller --onefile --windowed --noupx --name "MartinezOrders" --icon=icon.ico --add-data "config.example.json;." phonecaller.py
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
